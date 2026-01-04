@@ -28,31 +28,6 @@
 
 namespace njudb {
 
-// Debug functions
-static void DebugPrintLeaf(const BPTreeLeafPage *leaf_node, const RecordSchema *key_schema)
-{
-  // print all keys in the leaf node for debugging
-  page_id_t leaf_page_id = leaf_node->GetPageId();
-  printf("Leaf %d: ", leaf_page_id);
-  for (int i = 0; i < leaf_node->GetSize(); i++) {
-    Record current_key(key_schema, nullptr, leaf_node->KeyAt(i), INVALID_RID);
-    printf("key[%d]: %s; ", i, current_key.GetValueAt(0)->ToString().c_str());
-  }
-  printf("\n");
-}
-
-static void DebugPrintInternal(const BPTreeInternalPage *internal_node, const RecordSchema *key_schema)
-{
-  // print all keys in the internal node for debugging
-  page_id_t internal_page_id = internal_node->GetPageId();
-  printf("Internal %d: ", internal_page_id);
-  for (int i = 0; i < internal_node->GetSize(); i++) {
-    Record current_key(key_schema, nullptr, internal_node->KeyAt(i), INVALID_RID);
-    printf("key[%d]: %s, value: %d; ", i, current_key.GetValueAt(0)->ToString().c_str(), internal_node->ValueAt(i));
-  }
-  printf("\n");
-}
-
 // BPTreePage implementation
 void BPTreePage::Init(idx_id_t index_id, page_id_t page_id, page_id_t parent_id, BPTreeNodeType node_type, int max_size)
 {
@@ -108,13 +83,11 @@ auto BPTreePage::IsSafe(bool is_insert) const -> bool
 {
   if (is_insert) {
     return size_ < max_size_;
-  } else {
-    if(IsLeaf()) {
-      return size_ > max_size_ / 2;
-    }
-    return size_ > (max_size_ + 1) / 2;
-    
   }
+  if (IsLeaf()) {
+    return size_ > max_size_ / 2;
+  }
+  return size_ > (max_size_ + 1) / 2;
 }
 
 // BPTreeLeafPage implementation
@@ -596,32 +569,6 @@ void BPTreeIndex::InitializeIndex()
 #endif
 }
 
-// auto BPTreeIndex::NewPage() -> page_id_t
-// {
-//   //std::unique_lock lock(index_latch_);
-  
-//   auto header_guard = buffer_pool_manager_->FetchPageWrite(index_id_, FILE_HEADER_PAGE_ID);
-//   auto header = reinterpret_cast<BPTreeIndexHeader *>(header_guard.GetMutableData());
-  
-//   page_id_t new_page_id;
-  
-//   if (header->first_free_page_id_ != INVALID_PAGE_ID) {
-//     new_page_id = header->first_free_page_id_;
-//     auto free_page_guard = buffer_pool_manager_->FetchPageWrite(index_id_, new_page_id);
-//     header->first_free_page_id_ = *reinterpret_cast<page_id_t *>(PageContentPtr(free_page_guard.GetMutableData()));
-    
-//     // // Clear the page
-//     // memset(PageContentPtr(free_page_guard.GetMutableData()), 0, PAGE_SIZE - PAGE_HEADER_SIZE);
-//   } else {
-//     // Allocate new page
-//     new_page_id = header->page_num_;
-//     header->page_num_++;
-    
-
-//   }
-  
-//   return new_page_id;
-// }
 auto BPTreeIndex::NewPage() -> page_id_t
 {
   auto header_guard = buffer_pool_manager_->FetchPageWrite(index_id_, FILE_HEADER_PAGE_ID);
@@ -632,12 +579,10 @@ auto BPTreeIndex::NewPage() -> page_id_t
   // 检查是否有空闲页面可重用
   if (header->first_free_page_id_ != INVALID_PAGE_ID) {
     new_page_id = header->first_free_page_id_;
-    
+
     // 获取空闲页面来读取下一个空闲页面ID
     auto free_page_guard = buffer_pool_manager_->FetchPageWrite(index_id_, new_page_id);
-    auto free_page = reinterpret_cast<Page *>(free_page_guard.GetMutableData());
 
-    
     // 正确方式2：如果页面内容布局已知，第一个 sizeof(page_id_t) 存储 next_free
     page_id_t next_free = *reinterpret_cast<page_id_t *>(free_page_guard.GetMutableData() + PAGE_NEXT_FREE_PAGE_ID_OFFSET);
     header->first_free_page_id_ = next_free;
@@ -750,13 +695,10 @@ void BPTreeIndex::StartNewTree(const Record &key, const RID &value)
   auto root_page = reinterpret_cast<BPTreeLeafPage *>(PageContentPtr(root_guard.GetMutableData()));
   
   root_page->Init(index_id_, root_page_id, INVALID_PAGE_ID, header->key_size_, header->leaf_max_size_);
-  
-  //printf("Before insertion into new root leaf:\n");
-  //DebugPrintLeaf(root_page, key_schema_);
-  
-  int insert_pos = root_page->Insert(key, value, key_schema_);
-  
-  
+
+  root_page->Insert(key, value, key_schema_);
+
+
   // header->root_page_id_ = root_page_id;
   // header->tree_height_ = 1;
   // header->num_entries_ = 1;
@@ -767,122 +709,6 @@ void BPTreeIndex::StartNewTree(const Record &key, const RID &value)
   //(reinterpret_cast<BPTreeIndexHeader *>(writeguardforheader.GetMutableData()))->num_entries_ = 1;
 }
 
-// auto BPTreeIndex::InsertIntoLeaf(const Record &key, const RID &value) -> bool
-// {
-//   page_id_t leaf_page_id = FindLeafPage(key,false);
-  
-//   if (leaf_page_id == INVALID_PAGE_ID) {
-//     return false;
-//   }
-  
-//   auto leaf_guard = buffer_pool_manager_->FetchPageWrite(index_id_, leaf_page_id);
-//   auto leaf_page = reinterpret_cast<BPTreeLeafPage *>(PageContentPtr(leaf_guard.GetMutableData()));
-  
-//   auto header_guard = buffer_pool_manager_->FetchPageWrite(index_id_, FILE_HEADER_PAGE_ID);
-//   auto header = reinterpret_cast<BPTreeIndexHeader *>(header_guard.GetMutableData());
-  
-//   // // 调试：插入前打印叶子节点状态
-//   // DebugPrintLeaf(leaf_page, key_schema_);
-  
-//   // Check if leaf has space
-//   if (leaf_page->GetSize() < leaf_page->GetMaxSize()) {
-//     // Direct insertion
-//     int insert_pos = leaf_page->Insert(key, value, key_schema_);
-    
-//     //header->num_entries_++;
-    
-//     // // 调试：插入后打印叶子节点状态
-//     // DebugPrintLeaf(leaf_page, key_schema_);
-    
-//     return true;
-//   } else {
-
-    
-//     // Create new leaf page
-//     page_id_t new_leaf_page_id = NewPage();
-    
-//     auto new_leaf_guard = buffer_pool_manager_->FetchPageWrite(index_id_, new_leaf_page_id);
-//     auto new_leaf_page = reinterpret_cast<BPTreeLeafPage *>(PageContentPtr(new_leaf_guard.GetMutableData()));
-    
-//     // Initialize new leaf
-//     new_leaf_page->Init(index_id_, new_leaf_page_id, leaf_page->GetParentPageId(),
-//                        header->key_size_, header->leaf_max_size_);
-    
-
-    
-//     // Create temporary arrays for all keys (original + new)
-//     int total_keys = leaf_page->GetSize() + 1;
-//     std::vector<char> all_keys(total_keys * header->key_size_);
-//     std::vector<RID> all_values(total_keys);
-
-//     //     // Find insertion position for new key
-//     // int insert_pos = 0;
-//     // for (int i = 0; i < leaf_page->GetSize(); i++) {
-//     //   Record current_key(key_schema_, nullptr, leaf_page->KeyAt(i), INVALID_RID);
-//     //   if (Record::Compare(current_key, key) < 0) {
-//     //     insert_pos++;
-//     //   } else {
-//     //     break;
-//     //   }
-//     // }
-//       int index = leaf_page->KeyIndex(key, key_schema_);
-    
-//     // Copy original keys
-//     for (int i = 0; i < index; i++) {
-//       memcpy(all_keys.data() + i * header->key_size_, 
-//              leaf_page->KeyAt(i), header->key_size_);
-//       all_values[i] = leaf_page->ValueAt(i);
-//     }
-    
-
-//         // Insert new key
-//     memcpy(all_keys.data() + index * header->key_size_, key.GetData(), header->key_size_);
-//     all_values[index] = value;
-    
-//     // Make space for new key
-//     // for (int i = total_keys - 1; i > index; i--) {
-//     //   memcpy(all_keys.data() + i * header->key_size_,
-//     //          all_keys.data() + (i - 1) * header->key_size_, header->key_size_);
-//     //   all_values[i] = all_values[i - 1];
-//     // }
-//       for (int i = index; i < leaf_page->GetSize(); i++) {
-//     std::memcpy(all_keys.data() + (i + 1) * header->key_size_, leaf_page->KeyAt(i), header->key_size_);
-//     all_values[i + 1] = leaf_page->ValueAt(i);
-//   }
-    
-//     int split_index = total_keys / 2;
-    
-  
-    
-//     // Copy first half to original leaf
-//     for (int i = 0; i < split_index; i++) {
-//       leaf_page->SetKeyAt(i, all_keys.data() + i * header->key_size_);
-//       leaf_page->SetValueAt(i, all_values[i]);
-//     }
-//     leaf_page->SetSize(split_index);
-    
-//     // Copy second half to new leaf
-//     for (int i = split_index; i < total_keys; i++) {
-//       new_leaf_page->SetKeyAt(i - split_index, all_keys.data() + i * header->key_size_);
-//       new_leaf_page->SetValueAt(i - split_index, all_values[i]);
-//     }
-//     new_leaf_page->SetSize(total_keys - split_index);
-//         // Update sibling pointers
-//     new_leaf_page->SetNextPageId(leaf_page->GetNextPageId());
-//     leaf_page->SetNextPageId(new_leaf_page_id);
-    
-//     // Get first key of new leaf as separator
-//     Record separator_key(key_schema_, nullptr, new_leaf_page->KeyAt(0), INVALID_RID);
-    
-//     //header->num_entries_++;
-  
-    
-//     // Insert separator key into parent
-//     InsertIntoParent(leaf_page->GetPageId(), separator_key, new_leaf_page_id);
-    
-//     return true;
-//   }
-// }
 auto BPTreeIndex::InsertIntoLeaf(const Record &key, const RID &value) -> bool
 {
   page_id_t leaf_page_id = FindLeafPage(key,false);
@@ -1256,68 +1082,6 @@ auto BPTreeIndex::Delete(const Record &key) -> bool
   return true;
 }
 
-// auto BPTreeIndex::CoalesceOrRedistribute(page_id_t node_id) -> bool
-// {
-//   auto node_guard = buffer_pool_manager_->FetchPageWrite(index_id_, node_id);
-//   auto node_page = reinterpret_cast<BPTreePage *>(PageContentPtr(node_guard.GetMutableData()));
-  
-//   if (node_page->IsRoot()) {
-//     return AdjustRoot(node_page);
-//   }
-  
-//   // Get parent
-//   page_id_t parent_id = node_page->GetParentPageId();
-//   auto parent_guard = buffer_pool_manager_->FetchPageWrite(index_id_, parent_id);
-//   auto parent_page = reinterpret_cast<BPTreeInternalPage *>(PageContentPtr(parent_guard.GetMutableData()));
-  
-//   // Find node's index in parent
-//   int node_index = -1;
-//   for (int i = 0; i < parent_page->GetSize(); i++) {
-//     if (parent_page->ValueAt(i) == node_id) {
-//       node_index = i;
-//       break;
-//     }
-//   }
-  
-//   if (node_index == -1) {
-//     return false;
-//   }
-  
-//   // Try to borrow from left sibling
-//   if (node_index > 0) {
-//     page_id_t left_sibling_id = parent_page->ValueAt(node_index - 1);
-//     auto left_sibling_guard = buffer_pool_manager_->FetchPageWrite(index_id_, left_sibling_id);
-//     auto left_sibling = reinterpret_cast<BPTreePage *>(PageContentPtr(left_sibling_guard.GetMutableData()));
-    
-//     if (left_sibling->IsSafe(false)) {
-//       Redistribute(left_sibling, node_page, node_index - 1);
-//       return true;
-//     }
-//   }
-  
-//   // Try to borrow from right sibling
-//   if (node_index < parent_page->GetSize() - 1) {
-//     page_id_t right_sibling_id = parent_page->ValueAt(node_index + 1);
-//     auto right_sibling_guard = buffer_pool_manager_->FetchPageWrite(index_id_, right_sibling_id);
-//     auto right_sibling = reinterpret_cast<BPTreePage *>(PageContentPtr(right_sibling_guard.GetMutableData()));
-    
-//     if (right_sibling->IsSafe(false)) {
-//       Redistribute(right_sibling, node_page, node_index + 1);
-//       return true;
-//     }
-//   }
-  
-//   // Need to coalesce
-//   if (node_index > 0) {
-//     // Coalesce with left sibling
-//     page_id_t left_sibling_id = parent_page->ValueAt(node_index - 1);
-//     return Coalesce(left_sibling_id, node_id, parent_id, node_index);
-//   } else {
-//     // Coalesce with right sibling
-//     page_id_t right_sibling_id = parent_page->ValueAt(node_index + 1);
-//     return Coalesce(node_id, right_sibling_id, parent_id, node_index + 1);
-//   }
-// }
 auto BPTreeIndex::CoalesceOrRedistribute(page_id_t node_id) -> bool
 {
   // 先读取节点信息
@@ -1486,143 +1250,6 @@ auto BPTreeIndex::Coalesce(page_id_t neighbor_node_id, page_id_t node_id, page_i
   return true;
 }
 
-// void BPTreeIndex::Redistribute(BPTreePage *neighbor_node, BPTreePage *node, int index)
-// {
-//   auto parent_guard = buffer_pool_manager_->FetchPageWrite(index_id_, node->GetParentPageId());
-//   auto parent_page = reinterpret_cast<BPTreeInternalPage *>(PageContentPtr(parent_guard.GetMutableData()));
-  
-//   // Find indices in parent
-//   int node_index = -1;
-//   int neighbor_index = -1;
-  
-//   for (int i = 0; i < parent_page->GetSize(); i++) {
-//     if (parent_page->ValueAt(i) == node->GetPageId()) {
-//       node_index = i;
-//     }
-//     if (parent_page->ValueAt(i) == neighbor_node->GetPageId()) {
-//       neighbor_index = i;
-//     }
-//   }
-  
-//   bool is_left_neighbor = (neighbor_index < node_index);
-  
-//   if (node->IsLeaf()) {
-//     auto leaf_node = reinterpret_cast<BPTreeLeafPage *>(node);
-//     auto neighbor_leaf = reinterpret_cast<BPTreeLeafPage *>(neighbor_node);
-    
-//     if (is_left_neighbor) {
-//       // Borrow from left neighbor
-//       int last_index = neighbor_leaf->GetSize() - 1;
-      
-//       // Make space in node
-//       for (int i = leaf_node->GetSize(); i > 0; i--) {
-//         leaf_node->SetKeyAt(i, leaf_node->KeyAt(i - 1));
-//         leaf_node->SetValueAt(i, leaf_node->ValueAt(i - 1));
-//       }
-      
-//       // Copy last element from neighbor
-//       leaf_node->SetKeyAt(0, neighbor_leaf->KeyAt(last_index));
-//       leaf_node->SetValueAt(0, neighbor_leaf->ValueAt(last_index));
-      
-//       // Update sizes
-//       leaf_node->SetSize(leaf_node->GetSize() + 1);
-//       neighbor_leaf->SetSize(neighbor_leaf->GetSize() - 1);
-      
-//       // Update parent key
-//       Record new_key(key_schema_, nullptr, leaf_node->KeyAt(0), INVALID_RID);
-//       parent_page->SetKeyAt(node_index, new_key.GetData());
-//     } else {
-//       // Borrow from right neighbor
-//       // Move first element from neighbor to end of node
-//       leaf_node->SetKeyAt(leaf_node->GetSize(), neighbor_leaf->KeyAt(0));
-//       leaf_node->SetValueAt(leaf_node->GetSize(), neighbor_leaf->ValueAt(0));
-//       leaf_node->SetSize(leaf_node->GetSize() + 1);
-      
-//       // Shift neighbor's elements left
-//       for (int i = 0; i < neighbor_leaf->GetSize() - 1; i++) {
-//         neighbor_leaf->SetKeyAt(i, neighbor_leaf->KeyAt(i + 1));
-//         neighbor_leaf->SetValueAt(i, neighbor_leaf->ValueAt(i + 1));
-//       }
-//       neighbor_leaf->SetSize(neighbor_leaf->GetSize() - 1);
-      
-//       // Update parent key
-//       Record new_key(key_schema_, nullptr, neighbor_leaf->KeyAt(0), INVALID_RID);
-//       parent_page->SetKeyAt(neighbor_index, new_key.GetData());
-//     }
-//   } else {
-//     // Internal node redistribution
-//     auto internal_node = reinterpret_cast<BPTreeInternalPage *>(node);
-//     auto neighbor_internal = reinterpret_cast<BPTreeInternalPage *>(neighbor_node);
-    
-//     if (is_left_neighbor) {
-//       // Borrow from left neighbor
-//       int last_index = neighbor_internal->GetSize() - 1;
-      
-//       // Get parent separator key
-//       Record parent_key(key_schema_, nullptr, parent_page->KeyAt(node_index), INVALID_RID);
-      
-//       // Make space in node
-//       for (int i = internal_node->GetSize(); i > 0; i--) {
-//         internal_node->SetKeyAt(i + 1, internal_node->KeyAt(i));
-//       }
-//       for (int i = internal_node->GetSize(); i >= 0; i--) {
-//         internal_node->SetValueAt(i + 1, internal_node->ValueAt(i));
-//       }
-      
-//       // Move parent key to node
-//       internal_node->SetKeyAt(1, parent_key.GetData());
-//       internal_node->SetValueAt(0, neighbor_internal->ValueAt(last_index));
-      
-//       // Update parent key with neighbor's last key
-//       Record new_parent_key(key_schema_, nullptr, neighbor_internal->KeyAt(last_index), INVALID_RID);
-//       parent_page->SetKeyAt(node_index, new_parent_key.GetData());
-      
-//       // Update sizes
-//       internal_node->SetSize(internal_node->GetSize() + 1);
-//       neighbor_internal->SetSize(neighbor_internal->GetSize() - 1);
-      
-//       // Update child's parent pointer
-//       page_id_t child_id = internal_node->ValueAt(0);
-//       if (child_id != INVALID_PAGE_ID) {
-//         auto child_guard = buffer_pool_manager_->FetchPageWrite(index_id_, child_id);
-//         auto child_page = reinterpret_cast<BPTreePage *>(PageContentPtr(child_guard.GetMutableData()));
-//         child_page->SetParentPageId(internal_node->GetPageId());
-//       }
-//     } else {
-//       // Borrow from right neighbor
-//       // Get parent separator key
-//       Record parent_key(key_schema_, nullptr, parent_page->KeyAt(neighbor_index), INVALID_RID);
-      
-//       // Move parent key to end of node
-//       internal_node->SetKeyAt(internal_node->GetSize() + 1, parent_key.GetData());
-//       internal_node->SetValueAt(internal_node->GetSize() + 1, neighbor_internal->ValueAt(0));
-      
-//       // Update parent key with neighbor's first key
-//       Record new_parent_key(key_schema_, nullptr, neighbor_internal->KeyAt(1), INVALID_RID);
-//       parent_page->SetKeyAt(neighbor_index, new_parent_key.GetData());
-      
-//       // Shift neighbor's elements left
-//       for (int i = 0; i < neighbor_internal->GetSize() - 2; i++) {
-//         neighbor_internal->SetKeyAt(i + 1, neighbor_internal->KeyAt(i + 2));
-//       }
-//       for (int i = 0; i < neighbor_internal->GetSize() - 1; i++) {
-//         neighbor_internal->SetValueAt(i, neighbor_internal->ValueAt(i + 1));
-//       }
-      
-//       // Update sizes
-//       internal_node->SetSize(internal_node->GetSize() + 1);
-//       neighbor_internal->SetSize(neighbor_internal->GetSize() - 1);
-      
-//       // Update child's parent pointer
-//       page_id_t child_id = internal_node->ValueAt(internal_node->GetSize());
-//       if (child_id != INVALID_PAGE_ID) {
-//         auto child_guard = buffer_pool_manager_->FetchPageWrite(index_id_, child_id);
-//         auto child_page = reinterpret_cast<BPTreePage *>(PageContentPtr(child_guard.GetMutableData()));
-//         child_page->SetParentPageId(internal_node->GetPageId());
-//       }
-//     }
-//   }
-// }
 void BPTreeIndex::Redistribute(BPTreePage *neighbor_node, BPTreePage *node, int index)
 {
   // 获取父节点
@@ -1696,78 +1323,6 @@ void BPTreeIndex::Redistribute(BPTreePage *neighbor_node, BPTreePage *node, int 
       }
     }
   } 
-  // else {
-  //   // 内部节点的重新分配（根据错误代码的实现，但正确代码中不需要）
-  //   // 这里保持错误代码的逻辑，但实际上不会被调用
-  //   auto internal_node = reinterpret_cast<BPTreeInternalPage *>(node);
-  //   auto neighbor_internal = reinterpret_cast<BPTreeInternalPage *>(neighbor_node);
-    
-  //   if (neighbor_is_left_side) {
-  //     // 从左侧内部邻居借用
-  //     int last_neighbor_idx = neighbor_internal->GetSize() - 1;
-      
-  //     Record parent_key_record(key_schema_, nullptr, parent_page->KeyAt(current_node_position), INVALID_RID);
-      
-  //     // 为目标节点创建空间
-  //     for (int pos = internal_node->GetSize(); pos > 0; pos--) {
-  //       internal_node->SetKeyAt(pos + 1, internal_node->KeyAt(pos));
-  //     }
-  //     for (int pos = internal_node->GetSize(); pos >= 0; pos--) {
-  //       internal_node->SetValueAt(pos + 1, internal_node->ValueAt(pos));
-  //     }
-      
-  //     // 移动父节点键和邻居值
-  //     internal_node->SetKeyAt(1, parent_key_record.GetData());
-  //     internal_node->SetValueAt(0, neighbor_internal->ValueAt(last_neighbor_idx));
-      
-  //     // 更新父节点键
-  //     Record new_parent_key(key_schema_, nullptr, neighbor_internal->KeyAt(last_neighbor_idx), INVALID_RID);
-  //     parent_page->SetKeyAt(current_node_position, new_parent_key.GetData());
-      
-  //     // 更新节点大小
-  //     internal_node->SetSize(internal_node->GetSize() + 1);
-  //     neighbor_internal->SetSize(neighbor_internal->GetSize() - 1);
-      
-  //     // 更新子节点父指针
-  //     page_id_t child_page_id = internal_node->ValueAt(0);
-  //     if (child_page_id != INVALID_PAGE_ID) {
-  //       auto child_guard = buffer_pool_manager_->FetchPageWrite(index_id_, child_page_id);
-  //       auto child_page = reinterpret_cast<BPTreePage *>(PageContentPtr(child_guard.GetMutableData()));
-  //       child_page->SetParentPageId(internal_node->GetPageId());
-  //     }
-  //   } else {
-  //     // 从右侧内部邻居借用
-  //     Record parent_key_record(key_schema_, nullptr, parent_page->KeyAt(neighbor_node_position), INVALID_RID);
-      
-  //     // 将父节点键和邻居值添加到目标节点
-  //     internal_node->SetKeyAt(internal_node->GetSize() + 1, parent_key_record.GetData());
-  //     internal_node->SetValueAt(internal_node->GetSize() + 1, neighbor_internal->ValueAt(0));
-      
-  //     // 更新父节点键
-  //     Record new_parent_key(key_schema_, nullptr, neighbor_internal->KeyAt(1), INVALID_RID);
-  //     parent_page->SetKeyAt(neighbor_node_position, new_parent_key.GetData());
-      
-  //     // 移动邻居节点条目
-  //     for (int pos = 0; pos < neighbor_internal->GetSize() - 2; pos++) {
-  //       neighbor_internal->SetKeyAt(pos + 1, neighbor_internal->KeyAt(pos + 2));
-  //     }
-  //     for (int pos = 0; pos < neighbor_internal->GetSize() - 1; pos++) {
-  //       neighbor_internal->SetValueAt(pos, neighbor_internal->ValueAt(pos + 1));
-  //     }
-      
-  //     // 更新节点大小
-  //     internal_node->SetSize(internal_node->GetSize() + 1);
-  //     neighbor_internal->SetSize(neighbor_internal->GetSize() - 1);
-      
-  //     // 更新子节点父指针
-  //     page_id_t child_page_id = internal_node->ValueAt(internal_node->GetSize());
-  //     if (child_page_id != INVALID_PAGE_ID) {
-  //       auto child_guard = buffer_pool_manager_->FetchPageWrite(index_id_, child_page_id);
-  //       auto child_page = reinterpret_cast<BPTreePage *>(PageContentPtr(child_guard.GetMutableData()));
-  //       child_page->SetParentPageId(internal_node->GetPageId());
-  //     }
-  //   }
-  // }
 }
 
 auto BPTreeIndex::AdjustRoot(BPTreePage *old_root_node) -> bool
@@ -1950,48 +1505,31 @@ auto BPTreeIndex::BPTreeIterator::GetRID() -> RID
 auto BPTreeIndex::Begin() -> std::unique_ptr<IIterator>
 {
   std::shared_lock lock(index_latch_);
-  
+
   auto header_guard = buffer_pool_manager_->FetchPageRead(index_id_, FILE_HEADER_PAGE_ID);
   auto header = reinterpret_cast<const BPTreeIndexHeader *>(header_guard.GetData());
-  
+
   if (header->root_page_id_ == INVALID_PAGE_ID) {
     return std::make_unique<BPTreeIterator>(this, INVALID_PAGE_ID, 0);
   }
-  
-  // Find leftmost leaf
+
   page_id_t current_page_id = header->root_page_id_;
-  
+
   while (true) {
     auto current_guard = buffer_pool_manager_->FetchPageRead(index_id_, current_page_id);
     auto current_page = reinterpret_cast<const BPTreePage *>(PageContentPtr(current_guard.GetData()));
-    
+
     if (current_page->IsLeaf()) {
       break;
     }
-    
+
     auto internal_page = reinterpret_cast<const BPTreeInternalPage *>(current_page);
     current_page_id = internal_page->ValueAt(0);
   }
-  
+
   return std::make_unique<BPTreeIterator>(this, current_page_id, 0);
 }
 
-// auto BPTreeIndex::Begin(const Record &key) -> std::unique_ptr<IIterator>
-// {
-//   std::shared_lock lock(index_latch_);
-  
-//   page_id_t leaf_page_id = FindLeafPage(key);
-//   if (leaf_page_id == INVALID_PAGE_ID) {
-//     return std::make_unique<BPTreeIterator>(this, INVALID_PAGE_ID, 0);
-//   }
-  
-//   auto leaf_guard = buffer_pool_manager_->FetchPageRead(index_id_, leaf_page_id);
-//   auto leaf_page = reinterpret_cast<const BPTreeLeafPage *>(PageContentPtr(leaf_guard.GetData()));
-  
-//   int index = leaf_page->LowerBound(key, key_schema_);
-  
-//   return std::make_unique<BPTreeIterator>(this, leaf_page_id, index);
-// }
 auto BPTreeIndex::Begin(const Record &key) -> std::unique_ptr<IIterator>
 {
   std::shared_lock lock(index_latch_);
