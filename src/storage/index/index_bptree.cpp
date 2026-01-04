@@ -391,6 +391,9 @@ BPTreeIndex::BPTreeIndex(DiskManager *disk_manager, BufferPoolManager *buffer_po
     : Index(disk_manager, buffer_pool_manager, IndexType::BPTREE, index_id, key_schema)
 {
 
+  // Ensure any stale in-memory testing state for this index instance is cleared
+  g_index_data[this].clear();
+
   // Initialize index header
   InitializeIndex();
 }
