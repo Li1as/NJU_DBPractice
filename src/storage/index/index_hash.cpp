@@ -25,57 +25,52 @@
 #include <functional>
 #include <cstring>
 #include <stdexcept>
-#include <memory>
-#include <cstddef>
 
 namespace njudb {
 
 // HashBucketPage implementation
 auto HashBucketPage::GetMaxEntries(size_t key_size) -> size_t {
-  // available space for entries in the page's data area
-  // Use offsetof to account for struct padding and alignment
-  size_t header_size = offsetof(HashBucketPage, data_);
+  size_t header_size = sizeof(HashBucketPage);
   size_t available   = PAGE_SIZE - PAGE_HEADER_SIZE - header_size;
-  size_t entry_size  = key_size + sizeof(page_id_t) + sizeof(slot_id_t);
+  size_t entry_size  = key_size + sizeof(RID);
   return available / entry_size;
 }
 
 void HashBucketPage::WriteEntry(size_t offset, const Record &key, const RID &rid)
 {
-  size_t key_len = key.GetSchema()->GetRecordLength();
-  size_t entry_size = key_len + sizeof(page_id_t) + sizeof(slot_id_t);
-  // bounds check
-  size_t max_entries = GetMaxEntries(key_len);
-  NJUDB_ASSERT(offset < max_entries, "HashBucketPage::WriteEntry out of bounds");
-  char *dst = data_ + offset * entry_size;
-  // copy key raw bytes
-  std::memcpy(dst, key.GetData(), key_len);
-  dst += key_len;
-  // copy RID
-  *reinterpret_cast<page_id_t *>(dst) = rid.PageID();
-  dst += sizeof(page_id_t);
-  *reinterpret_cast<slot_id_t *>(dst) = rid.SlotID();
+  size_t key_size   = key.GetSchema()->GetRecordLength();
+  size_t entry_size = key_size + sizeof(RID);
+  auto   ptr        = reinterpret_cast<char *>(data_) + offset * entry_size;
+  std::memcpy(ptr, key.GetData(), key_size);
+  ptr += key_size;
+  // write RID as page_id_t and slot_id_t
+  page_id_t pid = rid.PageID();
+  slot_id_t sid = rid.SlotID();
+  std::memcpy(ptr, &pid, sizeof(page_id_t));
+  std::memcpy(ptr + sizeof(page_id_t), &sid, sizeof(slot_id_t));
 }
+
 
 void HashBucketPage::ReadEntry(size_t offset, Record &key, RID &rid, size_t key_size) const
 {
-  size_t max_entries = GetMaxEntries(key_size);
-  NJUDB_ASSERT(offset < max_entries, "HashBucketPage::ReadEntry out of bounds");
-  size_t entry_size = key_size + sizeof(page_id_t) + sizeof(slot_id_t);
-  const char *src   = data_ + offset * entry_size;
-  // copy key bytes into temporary buffer
-  std::unique_ptr<char[]> buf(new char[key_size]);
-  std::memcpy(buf.get(), src, key_size);
-  src += key_size;
+  size_t entry_size = key_size + sizeof(RID);
+  const char *ptr   = reinterpret_cast<const char *>(data_) + offset * entry_size;
+  // read key
+  char *keybuf = new char[key_size];
+  std::memcpy(keybuf, ptr, key_size);
+  ptr += key_size;
   // read RID
-  page_id_t pid = *reinterpret_cast<const page_id_t *>(src);
-  src += sizeof(page_id_t);
-  slot_id_t sid = *reinterpret_cast<const slot_id_t *>(src);
+  page_id_t pid;
+  slot_id_t sid;
+  std::memcpy(&pid, ptr, sizeof(page_id_t));
+  std::memcpy(&sid, ptr + sizeof(page_id_t), sizeof(slot_id_t));
   rid = RID(pid, sid);
-  // construct a temporary record from bytes then assign
-  Record tmp(key.GetSchema(), nullptr, buf.get(), rid);
+  // construct a temporary Record and assign
+  Record tmp(key.GetSchema(), nullptr, keybuf, rid);
   key = tmp;
+  delete[] keybuf;
 }
+
 
 // HashIndex implementation
 HashIndex::HashIndex(DiskManager *disk_manager, BufferPoolManager *buffer_pool_manager, idx_id_t index_id,
@@ -98,14 +93,6 @@ void HashIndex::InitializeHashIndex()
     // It is an index that has already been initialized
     bucket_count_  = header_page->bucket_count_;
     total_entries_ = header_page->total_entries_;
-    // sanitize directory entries to avoid pointing to reserved pages
-    auto directory_guard = buffer_pool_manager_->FetchPageWrite(index_id_, HASH_KEY_PAGE);
-    auto directory_page  = reinterpret_cast<HashBucketDirectory *>(directory_guard.GetMutableData());
-    for (size_t i = 0; i < bucket_count_; ++i) {
-      if (directory_page->bucket_page_ids_[i] != INVALID_PAGE_ID && directory_page->bucket_page_ids_[i] < 2) {
-        directory_page->bucket_page_ids_[i] = INVALID_PAGE_ID;
-      }
-    }
     return;
   }
 
@@ -123,13 +110,14 @@ void HashIndex::InitializeHashIndex()
   size_t max_bucket_refs = available_space / sizeof(page_id_t);
 
   if (bucket_count_ > max_bucket_refs) {
-    // Too many buckets for single directory page - limit to available space
+    // Too many buckets for single directory page - should handle this case
+    // For now, limit to available space
     bucket_count_              = max_bucket_refs;
     header_page->bucket_count_ = bucket_count_;
   }
 
-  // Initialize entire directory to invalid to avoid leftover pointers
-  for (size_t i = 0; i < max_bucket_refs; ++i) {
+  // Initialize bucket page IDs - initially all invalid
+  for (size_t i = 0; i < bucket_count_; ++i) {
     directory_page->bucket_page_ids_[i] = INVALID_PAGE_ID;
   }
 
@@ -163,263 +151,226 @@ auto HashIndex::GetBucketPage(page_id_t page_id) -> HashBucketPage *
 auto HashIndex::AllocateBucketPage() -> page_id_t
 {
   // Allocate a new bucket page
-  page_id_t new_page_id = INVALID_PAGE_ID;
-
   auto header_guard = buffer_pool_manager_->FetchPageWrite(index_id_, FILE_HEADER_PAGE_ID);
-  auto header      = reinterpret_cast<HashHeaderPage *>(header_guard.GetMutableData());
-  // defensive: header->next_page_id_ should never point to reserved pages
-  if (header->next_page_id_ < 2) {
-    header->next_page_id_ = 2;
-  }
-  new_page_id      = header->next_page_id_;
-  // bump next page id
-  header->next_page_id_++; 
+  auto header_page  = reinterpret_cast<HashHeaderPage *>(header_guard.GetMutableData());
 
-  // initialize the new page (only zero the page *content* area to avoid touching page header fields)
+  page_id_t new_page_id = header_page->next_page_id_++;
+
+  // initialize the page
   auto page_guard = buffer_pool_manager_->FetchPageWrite(index_id_, new_page_id);
-  auto page_data  = page_guard.GetMutableData();
-  std::memset(PageContentPtr(page_data), 0, PAGE_SIZE - PAGE_HEADER_SIZE);
-  auto bucket     = reinterpret_cast<HashBucketPage *>(PageContentPtr(page_data));
+  auto bucket     = reinterpret_cast<HashBucketPage *>(PageContentPtr(page_guard.GetMutableData()));
   bucket->next_page_id_ = INVALID_PAGE_ID;
   bucket->entry_count_  = 0;
+  // clear data area
+  size_t data_size = PAGE_SIZE - PAGE_HEADER_SIZE - sizeof(HashBucketPage);
+  std::memset(bucket->data_, 0, data_size);
 
   return new_page_id;
 }
 
 void HashIndex::Insert(const Record &key, const RID &rid)
 {
-  size_t bucket_index = Hash(key);
-  InsertIntoBucket(bucket_index, key, rid);
-  // update header total entries
+  size_t bucket_idx = Hash(key);
+  InsertIntoBucket(bucket_idx, key, rid);
+  // update header
   auto header_guard = buffer_pool_manager_->FetchPageWrite(index_id_, FILE_HEADER_PAGE_ID);
-  auto header      = reinterpret_cast<HashHeaderPage *>(header_guard.GetMutableData());
-  header->total_entries_++;
-  total_entries_++;
+  auto header_page  = reinterpret_cast<HashHeaderPage *>(header_guard.GetMutableData());
+  header_page->total_entries_ += 1;
+  total_entries_ = header_page->total_entries_;
 }
+
 
 void HashIndex::InsertIntoBucket(size_t bucket_index, const Record &key, const RID &rid)
 {
-  // locate bucket page id
-  auto dir_guard = buffer_pool_manager_->FetchPageWrite(index_id_, HASH_KEY_PAGE);
-  auto dir_page  = reinterpret_cast<HashBucketDirectory *>(dir_guard.GetMutableData());
-  page_id_t pid  = dir_page->bucket_page_ids_[bucket_index];
+  auto directory_guard = buffer_pool_manager_->FetchPageWrite(index_id_, HASH_KEY_PAGE);
+  auto directory      = reinterpret_cast<HashBucketDirectory *>(directory_guard.GetMutableData());
 
-  // defensive: if directory points to reserved or invalid pages, re-allocate
-  if (pid == INVALID_PAGE_ID || pid < 2) {
-    pid = AllocateBucketPage();
-    dir_page->bucket_page_ids_[bucket_index] = pid;
+  page_id_t page_id = directory->bucket_page_ids_[bucket_index];
+  if (page_id == INVALID_PAGE_ID) {
+    // allocate first bucket page
+    page_id = AllocateBucketPage();
+    directory->bucket_page_ids_[bucket_index] = page_id;
   }
 
-  // traverse chain to find a page with space
-  page_id_t cur = pid;
+  // find page with available space
+  page_id_t cur_page_id = page_id;
   while (true) {
-    auto page_guard = buffer_pool_manager_->FetchPageWrite(index_id_, cur);
+    auto page_guard = buffer_pool_manager_->FetchPageWrite(index_id_, cur_page_id);
     auto bucket     = reinterpret_cast<HashBucketPage *>(PageContentPtr(page_guard.GetMutableData()));
-    // defensive: sanitize next_page_id_ if it points to reserved pages (prevent accidental overwrite of header/dir)
-    if (bucket->next_page_id_ != INVALID_PAGE_ID && bucket->next_page_id_ < 2) {
-      bucket->next_page_id_ = INVALID_PAGE_ID;
-    }
     size_t max_ent  = HashBucketPage::GetMaxEntries(key_size_);
     if (bucket->entry_count_ < max_ent) {
-      // write at the end
-      NJUDB_ASSERT(bucket->entry_count_ < max_ent, "InsertIntoBucket: bucket entry_count exceeds max");
+      // append
       bucket->WriteEntry(bucket->entry_count_, key, rid);
       bucket->entry_count_++;
-      break;
+      return;
+    } else {
+      if (bucket->next_page_id_ == INVALID_PAGE_ID) {
+        page_id_t new_page = AllocateBucketPage();
+        bucket->next_page_id_ = new_page;
+        // move to new page
+        cur_page_id = new_page;
+      } else {
+        cur_page_id = bucket->next_page_id_;
+      }
     }
-    if (bucket->next_page_id_ != INVALID_PAGE_ID) {
-      cur = bucket->next_page_id_;
-      continue;
-    }
-    // allocate overflow page
-    page_id_t new_pid = AllocateBucketPage();
-    bucket->next_page_id_ = new_pid;
-    // write to new page
-    auto new_guard = buffer_pool_manager_->FetchPageWrite(index_id_, new_pid);
-    auto new_bucket = reinterpret_cast<HashBucketPage *>(PageContentPtr(new_guard.GetMutableData()));
-    NJUDB_ASSERT(new_bucket->entry_count_ < max_ent, "InsertIntoBucket: new bucket full (unexpected)");
-    new_bucket->WriteEntry(new_bucket->entry_count_, key, rid);
-    new_bucket->entry_count_++;
-    break;
   }
 }
+
 
 auto HashIndex::Delete(const Record &key) -> bool
 {
-  size_t bucket_index = Hash(key);
-  size_t deleted = DeleteAllFromBucket(bucket_index, key);
-  if (deleted == 0) return false;
-  auto header_guard = buffer_pool_manager_->FetchPageWrite(index_id_, FILE_HEADER_PAGE_ID);
-  auto header      = reinterpret_cast<HashHeaderPage *>(header_guard.GetMutableData());
-  header->total_entries_ -= deleted;
-  total_entries_ -= deleted;
-  return true;
+  size_t bucket_idx = Hash(key);
+  size_t deleted    = DeleteAllFromBucket(bucket_idx, key);
+  if (deleted > 0) {
+    auto header_guard = buffer_pool_manager_->FetchPageWrite(index_id_, FILE_HEADER_PAGE_ID);
+    auto header_page  = reinterpret_cast<HashHeaderPage *>(header_guard.GetMutableData());
+    header_page->total_entries_ -= deleted;
+    total_entries_ = header_page->total_entries_;
+    return true;
+  }
+  return false;
 }
+
 
 auto HashIndex::DeleteAllFromBucket(size_t bucket_index, const Record &key) -> size_t
 {
   size_t deleted = 0;
   auto dir_guard  = buffer_pool_manager_->FetchPageWrite(index_id_, HASH_KEY_PAGE);
-  auto dir_page   = reinterpret_cast<HashBucketDirectory *>(dir_guard.GetMutableData());
-  page_id_t pid   = dir_page->bucket_page_ids_[bucket_index];
-  if (pid == INVALID_PAGE_ID) return 0;
-  // defensive: directory pointer should not reference reserved pages
-  if (pid < 2) {
-    dir_page->bucket_page_ids_[bucket_index] = INVALID_PAGE_ID;
-    return 0;
-  }
+  auto directory  = reinterpret_cast<HashBucketDirectory *>(dir_guard.GetMutableData());
 
-  page_id_t cur = pid;
-  while (cur != INVALID_PAGE_ID) {
-    auto page_guard = buffer_pool_manager_->FetchPageWrite(index_id_, cur);
+  page_id_t *bucket_ref = &directory->bucket_page_ids_[bucket_index];
+  page_id_t cur_page_id = *bucket_ref;
+  page_id_t prev_page_id = INVALID_PAGE_ID;
+
+  size_t entry_size = key_size_ + sizeof(RID);
+
+  while (cur_page_id != INVALID_PAGE_ID) {
+    auto page_guard = buffer_pool_manager_->FetchPageWrite(index_id_, cur_page_id);
     auto bucket     = reinterpret_cast<HashBucketPage *>(PageContentPtr(page_guard.GetMutableData()));
-    // defensive: sanitize next page id if invalid
-    if (bucket->next_page_id_ != INVALID_PAGE_ID && bucket->next_page_id_ < 2) {
-      bucket->next_page_id_ = INVALID_PAGE_ID;
+    size_t i = 0;
+    while (i < bucket->entry_count_) {
+      char *entry_ptr = reinterpret_cast<char *>(bucket->data_) + i * entry_size;
+      if (std::memcmp(entry_ptr, key.GetData(), key_size_) == 0) {
+        // remove this entry by shifting left
+        char *src = entry_ptr + entry_size;
+        size_t move_bytes = (bucket->entry_count_ - i - 1) * entry_size;
+        if (move_bytes > 0) {
+          std::memmove(entry_ptr, src, move_bytes);
+        }
+        bucket->entry_count_--;
+        deleted++;
+        // continue without incrementing i to check the new occupant
+      } else {
+        ++i;
+      }
     }
-    size_t write_idx = 0;
-    size_t max_ent = HashBucketPage::GetMaxEntries(key_size_);
-    size_t orig = bucket->entry_count_;
-    if (orig > max_ent) {
-      // defensive: clamp to max_ent to avoid OOB reads
-      orig = max_ent;
-    }
-    size_t entry_size = key_size_ + sizeof(page_id_t) + sizeof(slot_id_t);
 
-    for (size_t read_idx = 0; read_idx < orig; ++read_idx) {
-      // read entry bytes
-      const char *src = bucket->data_ + read_idx * entry_size;
-      std::unique_ptr<char[]> buf(new char[key_size_]);
-      std::memcpy(buf.get(), src, key_size_);
-      src += key_size_;
-      page_id_t pid_entry = *reinterpret_cast<const page_id_t *>(src);
-      src += sizeof(page_id_t);
-      slot_id_t sid_entry = *reinterpret_cast<const slot_id_t *>(src);
-      RID rid_entry(pid_entry, sid_entry);
-      Record rec(key_schema_, nullptr, buf.get(), rid_entry);
-      if (Record::Compare(rec, key) == 0) {
-        ++deleted;
-        continue; // skip (i.e., delete)
+    // if page becomes empty, release it (if it's not the first page) or if first page empty and no next, release it
+    if (bucket->entry_count_ == 0) {
+      page_id_t next = bucket->next_page_id_;
+      // release this page guard before deleting
+      page_guard.Drop();
+      // safety: do not delete reserved pages (header, directory)
+      if (cur_page_id < HASH_KEY_PAGE + 1) {
+        // should not happen; just unlink without deleting to avoid corrupting file
+        if (prev_page_id == INVALID_PAGE_ID) {
+          *bucket_ref = next;
+        } else {
+          auto prev_guard = buffer_pool_manager_->FetchPageWrite(index_id_, prev_page_id);
+          auto prev_bucket = reinterpret_cast<HashBucketPage *>(PageContentPtr(prev_guard.GetMutableData()));
+          prev_bucket->next_page_id_ = next;
+        }
+        cur_page_id = next;
+        continue;
       }
-      // keep this entry, move to write_idx if needed
-      if (write_idx != read_idx) {
-        bucket->WriteEntry(write_idx, rec, rid_entry);
+      // delete this page
+      buffer_pool_manager_->DeletePage(index_id_, cur_page_id);
+      if (prev_page_id == INVALID_PAGE_ID) {
+        // first page
+        *bucket_ref = next;
+      } else {
+        // update prev page's next pointer
+        auto prev_guard = buffer_pool_manager_->FetchPageWrite(index_id_, prev_page_id);
+        auto prev_bucket = reinterpret_cast<HashBucketPage *>(PageContentPtr(prev_guard.GetMutableData()));
+        prev_bucket->next_page_id_ = next;
       }
-      write_idx++;
-    }
-    bucket->entry_count_ = write_idx;
-    // do not free empty pages for simplicity
-    {
-      page_id_t next_pid = bucket->next_page_id_;
-      if (next_pid != INVALID_PAGE_ID && next_pid < 2) {
-        // corrupted pointer, stop the chain
-        break;
-      }
-      cur = next_pid;
+      cur_page_id = next;
+      // do not update prev_page_id when deleting current page
+    } else {
+      // move to next
+      prev_page_id = cur_page_id;
+      cur_page_id = bucket->next_page_id_;
     }
   }
+
   return deleted;
 }
 
+
 auto HashIndex::Search(const Record &key) -> std::vector<RID>
 {
-  size_t bucket_index = Hash(key);
-  return SearchInBucket(bucket_index, key);
+  size_t bucket_idx = Hash(key);
+  return SearchInBucket(bucket_idx, key);
 }
+
 
 auto HashIndex::SearchInBucket(size_t bucket_index, const Record &key) -> std::vector<RID>
 {
-  std::vector<RID> result;
+  std::vector<RID> results;
   auto dir_guard = buffer_pool_manager_->FetchPageRead(index_id_, HASH_KEY_PAGE);
-  auto dir_page  = reinterpret_cast<const HashBucketDirectory *>(dir_guard.GetData());
-  page_id_t pid  = dir_page->bucket_page_ids_[bucket_index];
-  if (pid == INVALID_PAGE_ID) return result;
-  if (pid < 2) {
-    // sanitize directory and treat as empty
-    auto dir_guard_w = buffer_pool_manager_->FetchPageWrite(index_id_, HASH_KEY_PAGE);
-    auto dir_page_w  = reinterpret_cast<HashBucketDirectory *>(dir_guard_w.GetMutableData());
-    dir_page_w->bucket_page_ids_[bucket_index] = INVALID_PAGE_ID;
-    return result;
-  }
-
-  page_id_t cur = pid;
-  size_t entry_size = key_size_ + sizeof(page_id_t) + sizeof(slot_id_t);
+  auto directory = reinterpret_cast<const HashBucketDirectory *>(dir_guard.GetData());
+  page_id_t cur   = directory->bucket_page_ids_[bucket_index];
+  size_t entry_size = key_size_ + sizeof(RID);
   while (cur != INVALID_PAGE_ID) {
     auto page_guard = buffer_pool_manager_->FetchPageRead(index_id_, cur);
     auto bucket     = reinterpret_cast<const HashBucketPage *>(PageContentPtr(page_guard.GetData()));
-    size_t max_ent = HashBucketPage::GetMaxEntries(key_size_);
-    for (size_t i = 0; i < bucket->entry_count_ && i < max_ent; ++i) {
-      const char *src = bucket->data_ + i * entry_size;
-      std::unique_ptr<char[]> buf(new char[key_size_]);
-      std::memcpy(buf.get(), src, key_size_);
-      src += key_size_;
-      page_id_t pid_entry = *reinterpret_cast<const page_id_t *>(src);
-      src += sizeof(page_id_t);
-      slot_id_t sid_entry = *reinterpret_cast<const slot_id_t *>(src);
-      RID rid_entry(pid_entry, sid_entry);
-      Record rec(key_schema_, nullptr, buf.get(), rid_entry);
-      if (Record::Compare(rec, key) == 0) {
-        result.push_back(rid_entry);
+    for (size_t i = 0; i < bucket->entry_count_; ++i) {
+      const char *entry_ptr = reinterpret_cast<const char *>(bucket->data_) + i * entry_size;
+      if (std::memcmp(entry_ptr, key.GetData(), key_size_) == 0) {
+        page_id_t pid;
+        slot_id_t sid;
+        std::memcpy(&pid, entry_ptr + key_size_, sizeof(page_id_t));
+        std::memcpy(&sid, entry_ptr + key_size_ + sizeof(page_id_t), sizeof(slot_id_t));
+        results.emplace_back(pid, sid);
       }
     }
-    {
-      page_id_t next_pid = bucket->next_page_id_;
-      if (next_pid != INVALID_PAGE_ID && next_pid < 2) {
-        // corrupted pointer, treat as end of chain
-        break;
-      }
-      cur = next_pid;
-    }
+    cur = bucket->next_page_id_;
   }
-  return result;
+  return results;
 }
 
 auto HashIndex::SearchRange(const Record &low_key, const Record &high_key) -> std::vector<RID>
 {
-  std::vector<RID> result;
-  // scan all buckets
+  std::vector<RID> results;
+  auto dir_guard = buffer_pool_manager_->FetchPageRead(index_id_, HASH_KEY_PAGE);
+  auto directory = reinterpret_cast<const HashBucketDirectory *>(dir_guard.GetData());
+  size_t entry_size = key_size_ + sizeof(RID);
   for (size_t b = 0; b < bucket_count_; ++b) {
-    auto dir_guard = buffer_pool_manager_->FetchPageRead(index_id_, HASH_KEY_PAGE);
-    auto dir_page  = reinterpret_cast<const HashBucketDirectory *>(dir_guard.GetData());
-    page_id_t pid  = dir_page->bucket_page_ids_[b];
-    if (pid == INVALID_PAGE_ID) continue;
-    if (pid < 2) {
-      // sanitize directory
-      auto dir_guard_w = buffer_pool_manager_->FetchPageWrite(index_id_, HASH_KEY_PAGE);
-      auto dir_page_w  = reinterpret_cast<HashBucketDirectory *>(dir_guard_w.GetMutableData());
-      dir_page_w->bucket_page_ids_[b] = INVALID_PAGE_ID;
-      continue;
-    }
-    page_id_t cur = pid;
-    size_t entry_size = key_size_ + sizeof(page_id_t) + sizeof(slot_id_t);
+    page_id_t cur = directory->bucket_page_ids_[b];
     while (cur != INVALID_PAGE_ID) {
       auto page_guard = buffer_pool_manager_->FetchPageRead(index_id_, cur);
       auto bucket     = reinterpret_cast<const HashBucketPage *>(PageContentPtr(page_guard.GetData()));
-      size_t max_ent = HashBucketPage::GetMaxEntries(key_size_);
-      for (size_t i = 0; i < bucket->entry_count_ && i < max_ent; ++i) {
-        const char *src = bucket->data_ + i * entry_size;
-        std::unique_ptr<char[]> buf(new char[key_size_]);
-        std::memcpy(buf.get(), src, key_size_);
-        src += key_size_;
-        page_id_t pid_entry = *reinterpret_cast<const page_id_t *>(src);
-        src += sizeof(page_id_t);
-        slot_id_t sid_entry = *reinterpret_cast<const slot_id_t *>(src);
-        RID rid_entry(pid_entry, sid_entry);
-        Record rec(key_schema_, nullptr, buf.get(), rid_entry);
+      for (size_t i = 0; i < bucket->entry_count_; ++i) {
+        size_t key_len = GetKeySchema()->GetRecordLength();
+        const char *entry_ptr = reinterpret_cast<const char *>(bucket->data_) + i * (key_len + sizeof(RID));
+        // build a Record to compare
+        char *keybuf = new char[key_len];
+        std::memcpy(keybuf, entry_ptr, key_len);
+        page_id_t pid;
+        slot_id_t sid;
+        std::memcpy(&pid, entry_ptr + key_len, sizeof(page_id_t));
+        std::memcpy(&sid, entry_ptr + key_len + sizeof(page_id_t), sizeof(slot_id_t));
+        RID rid(pid, sid);
+        Record rec(low_key.GetSchema(), nullptr, keybuf, rid);
+        delete[] keybuf;
         if (Record::Compare(rec, low_key) >= 0 && Record::Compare(rec, high_key) <= 0) {
-          result.push_back(rid_entry);
+          results.push_back(rid);
         }
       }
-      {
-        page_id_t next_pid = bucket->next_page_id_;
-        if (next_pid != INVALID_PAGE_ID && next_pid < 2) {
-          break;
-        }
-        cur = next_pid;
-      }
+      cur = bucket->next_page_id_;
     }
   }
-  return result;
+  return results;
 }
 
 // HashIterator implementation
@@ -436,150 +387,140 @@ auto HashIndex::HashIterator::IsValid() -> bool { return !is_end_ && current_buc
 void HashIndex::HashIterator::Next()
 {
   if (is_end_) return;
-  // advance entry
-  ++current_entry_;
-  // check current page
+
+  // try move within current page
   if (current_page_id_ != INVALID_PAGE_ID) {
     auto page_guard = index_->buffer_pool_manager_->FetchPageRead(index_->index_id_, current_page_id_);
     auto bucket = reinterpret_cast<const HashBucketPage *>(PageContentPtr(page_guard.GetData()));
-    if (current_entry_ < bucket->entry_count_) {
-      return; // still valid in current page
+    if (current_entry_ + 1 < bucket->entry_count_) {
+      ++current_entry_;
+      return;
     }
-    // go to next page in chain
+    // try move to next overflow page
     if (bucket->next_page_id_ != INVALID_PAGE_ID) {
       current_page_id_ = bucket->next_page_id_;
       current_entry_ = 0;
       return;
     }
   }
+
   // move to next bucket
   ++current_bucket_;
-  current_entry_ = 0;
-  current_page_id_ = INVALID_PAGE_ID;
-  if (current_bucket_ >= index_->bucket_count_) {
-    is_end_ = true;
-    return;
-  }
-  // find next valid entry starting from current_bucket_
   FindNextValidEntry();
 }
 
+
 void HashIndex::HashIterator::FindNextValidEntry()
 {
-  // start from current_bucket_ and search for any non-empty bucket
+  auto dir_guard = index_->buffer_pool_manager_->FetchPageRead(index_->index_id_, HASH_KEY_PAGE);
+  auto directory = reinterpret_cast<const HashBucketDirectory *>(dir_guard.GetData());
+
   while (current_bucket_ < index_->bucket_count_) {
-    auto dir_guard = index_->buffer_pool_manager_->FetchPageRead(index_->index_id_, HASH_KEY_PAGE);
-    auto dir_page  = reinterpret_cast<const HashBucketDirectory *>(dir_guard.GetData());
-    page_id_t pid  = dir_page->bucket_page_ids_[current_bucket_];
-    if (pid == INVALID_PAGE_ID) {
-      ++current_bucket_;
-      continue;
-    }
-    if (pid < 2) {
-      // sanitize directory and skip
-      auto dir_guard_w = index_->buffer_pool_manager_->FetchPageWrite(index_->index_id_, HASH_KEY_PAGE);
-      auto dir_page_w  = reinterpret_cast<HashBucketDirectory *>(dir_guard_w.GetMutableData());
-      dir_page_w->bucket_page_ids_[current_bucket_] = INVALID_PAGE_ID;
-      ++current_bucket_;
-      continue;
-    }
-    // find first page in chain with entries
+    page_id_t pid = directory->bucket_page_ids_[current_bucket_];
     page_id_t cur = pid;
-    size_t entry_size = index_->key_size_ + sizeof(page_id_t) + sizeof(slot_id_t);
     while (cur != INVALID_PAGE_ID) {
       auto page_guard = index_->buffer_pool_manager_->FetchPageRead(index_->index_id_, cur);
-      auto bucket = reinterpret_cast<const HashBucketPage *>(PageContentPtr(page_guard.GetData()));      size_t max_ent = HashBucketPage::GetMaxEntries(index_->key_size_);
-      if (bucket->entry_count_ > max_ent) {
-        // defensive clamp: treat as if only valid entries are up to max_ent
-        if (max_ent == 0) {
-          cur = bucket->next_page_id_;
-          continue;
-        }
-      }      if (bucket->entry_count_ > 0) {
+      auto bucket = reinterpret_cast<const HashBucketPage *>(PageContentPtr(page_guard.GetData()));
+      if (bucket->entry_count_ > 0) {
         current_page_id_ = cur;
         current_entry_ = 0;
         return;
       }
-      {
-        page_id_t next_pid = bucket->next_page_id_;
-        if (next_pid != INVALID_PAGE_ID && next_pid < 2) {
-          // corrupted pointer, stop scanning this bucket
-          break;
-        }
-        cur = next_pid;
-      }
+      cur = bucket->next_page_id_;
     }
     ++current_bucket_;
   }
-  // no valid entries
+  // no more entries
   is_end_ = true;
 }
 
+
 auto HashIndex::HashIterator::GetKey() -> Record
 {
-  // construct a record from the current entry
-  NJUDB_ASSERT(!is_end_ && current_page_id_ != INVALID_PAGE_ID, "Iterator not valid");
-  size_t entry_size = index_->key_size_ + sizeof(page_id_t) + sizeof(slot_id_t);
+  if (is_end_) NJUDB_FATAL("Iterator out of range");
   auto page_guard = index_->buffer_pool_manager_->FetchPageRead(index_->index_id_, current_page_id_);
   auto bucket = reinterpret_cast<const HashBucketPage *>(PageContentPtr(page_guard.GetData()));
-  const char *src = bucket->data_ + current_entry_ * entry_size;
-  std::unique_ptr<char[]> buf(new char[index_->key_size_]);
-  std::memcpy(buf.get(), src, index_->key_size_);
-  src += index_->key_size_;
-  page_id_t pid_entry = *reinterpret_cast<const page_id_t *>(src);
-  src += sizeof(page_id_t);
-  slot_id_t sid_entry = *reinterpret_cast<const slot_id_t *>(src);
-  RID rid_entry(pid_entry, sid_entry);
-  Record rec(index_->key_schema_, nullptr, buf.get(), rid_entry);
+  size_t key_len = index_->GetKeySchema()->GetRecordLength();
+  size_t entry_size = key_len + sizeof(RID);
+  const char *entry_ptr = reinterpret_cast<const char *>(bucket->data_) + current_entry_ * entry_size;
+  char *keybuf = new char[key_len];
+  std::memcpy(keybuf, entry_ptr, key_len);
+  page_id_t pid;
+  slot_id_t sid;
+  std::memcpy(&pid, entry_ptr + key_len, sizeof(page_id_t));
+  std::memcpy(&sid, entry_ptr + key_len + sizeof(page_id_t), sizeof(slot_id_t));
+  RID rid(pid, sid);
+  Record rec(index_->GetKeySchema(), nullptr, keybuf, rid);
+  delete[] keybuf;
   return rec;
 }
 
 auto HashIndex::HashIterator::GetRID() -> RID
 {
-  NJUDB_ASSERT(!is_end_ && current_page_id_ != INVALID_PAGE_ID, "Iterator not valid");
-  size_t entry_size = index_->key_size_ + sizeof(page_id_t) + sizeof(slot_id_t);
+  if (is_end_) NJUDB_FATAL("Iterator out of range");
   auto page_guard = index_->buffer_pool_manager_->FetchPageRead(index_->index_id_, current_page_id_);
   auto bucket = reinterpret_cast<const HashBucketPage *>(PageContentPtr(page_guard.GetData()));
-  const char *src = bucket->data_ + current_entry_ * entry_size + index_->key_size_;
-  page_id_t pid_entry = *reinterpret_cast<const page_id_t *>(src);
-  src += sizeof(page_id_t);
-  slot_id_t sid_entry = *reinterpret_cast<const slot_id_t *>(src);
-  return RID(pid_entry, sid_entry);
+  size_t key_len = index_->GetKeySchema()->GetRecordLength();
+  size_t entry_size = key_len + sizeof(RID);
+  const char *entry_ptr = reinterpret_cast<const char *>(bucket->data_) + current_entry_ * entry_size;
+  page_id_t pid;
+  slot_id_t sid;
+  std::memcpy(&pid, entry_ptr + key_len, sizeof(page_id_t));
+  std::memcpy(&sid, entry_ptr + key_len + sizeof(page_id_t), sizeof(slot_id_t));
+  return RID(pid, sid);
 }
 
 auto HashIndex::Begin() -> std::unique_ptr<IIterator>
 {
-  return std::make_unique<HashIterator>(this, false);
+  // start from first non-empty bucket
+  auto it = std::make_unique<HashIterator>(this, false);
+  return it;
 }
 
 auto HashIndex::Begin(const Record &key) -> std::unique_ptr<IIterator>
 {
-  auto iter = std::make_unique<HashIterator>(this, false);
-  iter->current_bucket_ = Hash(key);
-  iter->current_entry_ = 0;
-  iter->current_page_id_ = INVALID_PAGE_ID;
-  iter->is_end_ = false;
-  iter->FindNextValidEntry();
-  return iter;
+  // For hash index, we can start from the bucket containing the key
+  auto it = std::make_unique<HashIterator>(this, false);
+  // move iterator to the bucket containing the provided key if possible
+  size_t bucket_idx = Hash(key);
+  it->current_bucket_ = bucket_idx;
+  it->FindNextValidEntry();
+  return it;
 }
 
 auto HashIndex::End() -> std::unique_ptr<IIterator> { return std::make_unique<HashIterator>(this, true); }
 
 void HashIndex::Clear()
 {
-  // reset header
-  auto header_guard = buffer_pool_manager_->FetchPageWrite(index_id_, FILE_HEADER_PAGE_ID);
-  auto header      = reinterpret_cast<HashHeaderPage *>(header_guard.GetMutableData());
-  header->total_entries_ = 0;
-  header->next_page_id_  = 2;
-  total_entries_ = 0;
-  // reset directory entries
   auto dir_guard = buffer_pool_manager_->FetchPageWrite(index_id_, HASH_KEY_PAGE);
-  auto dir_page  = reinterpret_cast<HashBucketDirectory *>(dir_guard.GetMutableData());
-  for (size_t i = 0; i < bucket_count_; ++i) {
-    dir_page->bucket_page_ids_[i] = INVALID_PAGE_ID;
+  auto directory = reinterpret_cast<HashBucketDirectory *>(dir_guard.GetMutableData());
+  auto header_guard = buffer_pool_manager_->FetchPageWrite(index_id_, FILE_HEADER_PAGE_ID);
+  auto header_page = reinterpret_cast<HashHeaderPage *>(header_guard.GetMutableData());
+
+  // delete all bucket pages
+  for (size_t b = 0; b < bucket_count_; ++b) {
+    page_id_t cur = directory->bucket_page_ids_[b];
+    while (cur != INVALID_PAGE_ID) {
+      auto page_guard = buffer_pool_manager_->FetchPageWrite(index_id_, cur);
+      page_id_t next = reinterpret_cast<HashBucketPage *>(PageContentPtr(page_guard.GetMutableData()))->next_page_id_;
+      // release before deleting
+      page_guard.Drop();
+      if (cur < HASH_KEY_PAGE + 1) {
+        // never delete header or directory
+        cur = next;
+        continue;
+      }
+      buffer_pool_manager_->DeletePage(index_id_, cur);
+      cur = next;
+    }
+    directory->bucket_page_ids_[b] = INVALID_PAGE_ID;
   }
+
+  header_page->total_entries_ = 0;
+  header_page->next_page_id_ = 2; // reset allocator
+  total_entries_ = 0;
 }
+
 
 auto HashIndex::IsEmpty() -> bool { return total_entries_ == 0; }
 
