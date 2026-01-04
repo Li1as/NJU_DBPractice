@@ -121,6 +121,10 @@ void HashIndex::InitializeHashIndex()
     directory_page->bucket_page_ids_[i] = INVALID_PAGE_ID;
   }
 
+  // Persist the initialized metadata immediately to avoid losing index structure
+  buffer_pool_manager_->FlushPage(index_id_, FILE_HEADER_PAGE_ID);
+  buffer_pool_manager_->FlushPage(index_id_, HASH_KEY_PAGE);
+
   // header_guard and directory_guard will automatically unpin the pages as dirty when they go out of scope
 }
 
@@ -155,6 +159,7 @@ auto HashIndex::AllocateBucketPage() -> page_id_t
   auto header_page  = reinterpret_cast<HashHeaderPage *>(header_guard.GetMutableData());
 
   page_id_t new_page_id = header_page->next_page_id_++;
+  buffer_pool_manager_->FlushPage(index_id_, FILE_HEADER_PAGE_ID);
 
   // initialize the page
   auto page_guard = buffer_pool_manager_->FetchPageWrite(index_id_, new_page_id);
@@ -177,6 +182,7 @@ void HashIndex::Insert(const Record &key, const RID &rid)
   auto header_page  = reinterpret_cast<HashHeaderPage *>(header_guard.GetMutableData());
   header_page->total_entries_ += 1;
   total_entries_ = header_page->total_entries_;
+  buffer_pool_manager_->FlushPage(index_id_, FILE_HEADER_PAGE_ID);
 }
 
 
@@ -190,6 +196,7 @@ void HashIndex::InsertIntoBucket(size_t bucket_index, const Record &key, const R
     // allocate first bucket page
     page_id = AllocateBucketPage();
     directory->bucket_page_ids_[bucket_index] = page_id;
+    buffer_pool_manager_->FlushPage(index_id_, HASH_KEY_PAGE);
   }
 
   // find page with available space
@@ -202,11 +209,13 @@ void HashIndex::InsertIntoBucket(size_t bucket_index, const Record &key, const R
       // append
       bucket->WriteEntry(bucket->entry_count_, key, rid);
       bucket->entry_count_++;
+      buffer_pool_manager_->FlushPage(index_id_, cur_page_id);
       return;
     } else {
       if (bucket->next_page_id_ == INVALID_PAGE_ID) {
         page_id_t new_page = AllocateBucketPage();
         bucket->next_page_id_ = new_page;
+        buffer_pool_manager_->FlushPage(index_id_, cur_page_id);
         // move to new page
         cur_page_id = new_page;
       } else {
@@ -226,6 +235,7 @@ auto HashIndex::Delete(const Record &key) -> bool
     auto header_page  = reinterpret_cast<HashHeaderPage *>(header_guard.GetMutableData());
     header_page->total_entries_ -= deleted;
     total_entries_ = header_page->total_entries_;
+    buffer_pool_manager_->FlushPage(index_id_, FILE_HEADER_PAGE_ID);
     return true;
   }
   return false;
@@ -259,6 +269,7 @@ auto HashIndex::DeleteAllFromBucket(size_t bucket_index, const Record &key) -> s
         }
         bucket->entry_count_--;
         deleted++;
+        buffer_pool_manager_->FlushPage(index_id_, cur_page_id);
         // continue without incrementing i to check the new occupant
       } else {
         ++i;
@@ -288,11 +299,13 @@ auto HashIndex::DeleteAllFromBucket(size_t bucket_index, const Record &key) -> s
       if (prev_page_id == INVALID_PAGE_ID) {
         // first page
         *bucket_ref = next;
+        buffer_pool_manager_->FlushPage(index_id_, HASH_KEY_PAGE);
       } else {
         // update prev page's next pointer
         auto prev_guard = buffer_pool_manager_->FetchPageWrite(index_id_, prev_page_id);
         auto prev_bucket = reinterpret_cast<HashBucketPage *>(PageContentPtr(prev_guard.GetMutableData()));
         prev_bucket->next_page_id_ = next;
+        buffer_pool_manager_->FlushPage(index_id_, prev_page_id);
       }
       cur_page_id = next;
       // do not update prev_page_id when deleting current page
@@ -519,6 +532,9 @@ void HashIndex::Clear()
   header_page->total_entries_ = 0;
   header_page->next_page_id_ = 2; // reset allocator
   total_entries_ = 0;
+
+  buffer_pool_manager_->FlushPage(index_id_, HASH_KEY_PAGE);
+  buffer_pool_manager_->FlushPage(index_id_, FILE_HEADER_PAGE_ID);
 }
 
 
